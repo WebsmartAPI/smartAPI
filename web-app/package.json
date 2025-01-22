@@ -59,7 +59,7 @@
     "jsdom": "^22.1.0",
     "prettier": "^3.0.3",
     "start-server-and-test": "^2.0.1",
-    "vite": "^4.4.11",
+    "vite": "^4.5.9",
     "vitest": "^0.34.6"
   }
 }
