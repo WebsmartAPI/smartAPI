@@ -96,6 +96,7 @@ APP_LIST = [
     (r"/api/metakg/consolidated/?", "handlers.api.MetaKGQueryHandler", {"biothing_type": "metakg_consolidated"}),
     (r"/api/metakg/consolidated/fields/?", "biothings.web.handlers.MetadataFieldHandler", {"biothing_type": "metakg_consolidated"}),
     (r"/api/metakg/paths/?", "handlers.api.MetaKGPathFinderHandler", {"biothing_type": "metakgpathfinder"}),
+    (r"/api/metakg/parse/?", "handlers.api.MetaKGParserHandler"),
 ]
 
 # biothings web tester will read this

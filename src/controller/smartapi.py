@@ -369,8 +369,14 @@ class SmartAPI(AbstractWebEntity, Mapping):
         """return True if a TRAPI"""
         return self.has_tags("trapi", "translator")
 
-    def get_metakg(self, include_trapi=True):
-        raw_metadata = decoder.to_dict(decoder.decompress(self._doc._raw))
+    def get_metakg(self, include_trapi=True, metadata_url=False):
+        if metadata_url:
+            data_id = decoder.get_id(self.url)
+            doc = self.get(data_id)
+            self._doc = doc._doc
+            raw_metadata = decoder.to_dict(decoder.decompress(doc._doc._raw))
+        else:
+            raw_metadata = decoder.to_dict(decoder.decompress(self._doc._raw))
         mkg_parser = MetaKGParser()
         extra_data = {"id": self._id, "url": self.url}
         self.metakg_errors = None  # reset metakg_errors

@@ -1,7 +1,9 @@
 import json
 import logging
 from copy import copy
-
+from tornado.web import HTTPError
+from utils.downloader import DownloadError
+from utils.metakg.metakg_errors import MetadataRetrievalError
 import requests
 
 from .api import API
@@ -13,36 +15,82 @@ class MetaKGParser:
     get_url_timeout = 60
     metakg_errors = None
 
-    def get_non_TRAPI_metadatas(self, data, extra_data=None):
-        parser = API(data)
+    def get_non_TRAPI_metadatas(self, data=None, extra_data=None, url=None):
+        """
+        Extract MetaKG edges from a SmartAPI document provided as `data` or fetched from a `url`.
+        Raises an error if no valid input is given.
+        """
+        if not data and not url:
+            raise MetadataRetrievalError(400, "Either data or url value is expected for this request, please provide data or a url.")
+
+        if data:
+            parser = API(smartapi_doc=data)
+        elif url:
+            parser = API(url=url)
+        else:
+            raise MetadataRetrievalError(404, "No metadata available from provided data or url.")
+
         mkg = self.extract_metakgedges(parser.metadata["operations"], extra_data=extra_data)
         no_nodes = len({x["subject"] for x in mkg} | {x["object"] for x in mkg})
         no_edges = len({x["predicate"] for x in mkg})
         logger.info("Done [%s nodes, %s edges]", no_nodes, no_edges)
         return mkg
 
-    def get_TRAPI_metadatas(self, data, extra_data=None):
-        ops = []
-        metadata_list = self.get_TRAPI_with_metakg_endpoint(data)
+    def get_TRAPI_metadatas(self, data=None, extra_data=None, url=None):
+        """
+        Extract and process TRAPI metadata from a SmartAPI document or URL.  
+        Returns MetaKG edges or propagates errors.  
+        """
+        if not data and not url:
+            raise MetadataRetrievalError(400, "Either data or url value is expected for this request, please provide data or a url.")
+
+        try:
+            if data:
+                metadata_list = self.get_TRAPI_with_metakg_endpoint(data=data)
+            else:
+                metadata_list = self.get_TRAPI_with_metakg_endpoint(url=url)
+        except MetadataRetrievalError:
+            raise MetadataRetrievalError(404, "No metadata available from provided data or url.")
+
         count_metadata_list = len(metadata_list)
         self.metakg_errors = {}
+        ops = []
+
         for i, metadata in enumerate(metadata_list):
             ops.extend(self.get_ops_from_metakg_endpoint(metadata, f"[{i + 1}/{count_metadata_list}]"))
+
         if self.metakg_errors:
-            cnt_metakg_errors = sum([len(x) for x in self.metakg_errors.values()])
+            cnt_metakg_errors = sum(len(x) for x in self.metakg_errors.values())
             logger.error(f"Found {cnt_metakg_errors} TRAPI metakg errors:\n {json.dumps(self.metakg_errors, indent=2)}")
 
         return self.extract_metakgedges(ops, extra_data=extra_data)
 
-    def get_TRAPI_with_metakg_endpoint(self, data):
-        metadatas = []
-        parser = API(data)
-        metadata = parser.metadata
+    def get_TRAPI_with_metakg_endpoint(self, data=None, url=None):
+        """ 
+        Retrieve TRAPI metadata from a SmartAPI document or URL.  
+        Returns metadata if TRAPI endpoints are found, else an empty list.  
+        """
+        if not data and not url:
+            raise MetadataRetrievalError(400, "Either data or url value is expected for this request, please provide data or a url.")
+
+        # Initialize API with either data or URL
+        parser = API(smartapi_doc=data) if data else API(url=url)
+
+        # Download the metadata
+        try:
+            metadata = parser.metadata
+        except DownloadError as dl_err:
+            raise dl_err
+
         _paths = metadata.get("paths", {})
         _team = metadata.get("x-translator", {}).get("team")
+
+        # Check for required TRAPI paths
         if "/meta_knowledge_graph" in _paths and "/query" in _paths and _team:
-            metadatas.append(metadata)
-        return metadatas
+            print("TRAPI metadata found.")
+            return [metadata]
+        else:
+            return []
 
     def construct_query_url(self, server_url):
         if server_url.endswith("/"):

@@ -1,7 +1,7 @@
+from builtins import ValueError, isinstance
 import asyncio
 import json
 import logging
-from typing import List, Union
 import os
 import bmt
 from biothings.utils import serializer
@@ -23,9 +23,10 @@ from utils.metakg.path_finder import MetaKGPathFinder
 from utils.metakg.cytoscape_formatter import CytoscapeDataFormatter
 from utils.metakg.biolink_helpers import get_expanded_values
 from utils.notification import SlackNewAPIMessage, SlackNewTranslatorAPIMessage
+from utils.metakg.parser import MetaKGParser
+from utils.metakg.metakg_errors import MetadataRetrievalError
 
 logger = logging.getLogger("smartAPI")
-
 
 def github_authenticated(func):
     """
@@ -495,7 +496,7 @@ class MetaKGQueryHandler(QueryHandler):
             api_dict = apis["api"]
             filtered_api= self.get_filtered_api(api_dict)
             apis["api"] = filtered_api
-            
+
     def write(self, chunk):
         """
         Overwrite the biothings query handler to ...
@@ -522,7 +523,7 @@ class MetaKGQueryHandler(QueryHandler):
                     self.set_header("Content-Disposition", 'attachment; filename="smartapi_metakg.graphml"')
 
                 return super(BaseAPIHandler, self).write(chunk)
-            
+
             if self.format == "html":
                 # setup template
                 template_path = os.path.abspath(os.path.join(os.path.dirname( __file__ ), '..', 'templates'))
@@ -689,9 +690,222 @@ class MetaKGPathFinderHandler(QueryHandler):
             raw_query_output = self.setup_pathfinder_rawquery(expanded_fields)
             self.write(raw_query_output)
             return
-        res = { 
-                "total": len(paths_with_edges), 
+        res = {
+                "total": len(paths_with_edges),
                 "paths": paths_with_edges,
             }
         await asyncio.sleep(0.01)
         self.finish(res)
+
+class MetaKGParserHandler(BaseHandler):
+    """
+        Handles parsing of SmartAPI metadata from a given URL or request body.
+
+        This handler processes SmartAPI metadata and returns structured,
+        cleaned results based on the specified query parameters.
+
+        Supported HTTP methods:
+        - **GET**: Parses metadata from a provided URL.
+        - **POST**: Parses metadata from the request body.
+
+        Query Parameters:
+        - `url` (str, required): The URL of the SmartAPI metadata to parse.
+            Maximum length: 1000 characters.
+        - `api_details` (bool, optional, default: `False`):
+            Whether to return detailed API information.
+        - `bte` (bool, optional, default: `False`):
+            Whether to include BTE (BioThings Explorer) specific metadata.
+    """
+
+    kwargs = {
+        "GET": {
+            "url": {
+                "type": str,
+                "required": True,
+                "max": 1000,
+                "description": "URL of the SmartAPI metadata to parse"
+            },
+            "api_details": {"type": bool, "default": 0 },
+            "bte": {"type": bool, "default": 0},
+        },
+        "POST": {
+            "api_details": {"type": bool, "default": 0 },
+            "bte": {"type": bool, "default": 0 },
+        },
+    }
+
+    def initialize(self, *args, **kwargs):
+        super().initialize(*args, **kwargs)
+        # change the default query pipeline from self.biothings.pipeline
+        self.pipeline = MetaKGQueryPipeline(ns=self.biothings)
+
+    def get_filtered_api(self, api_dict):
+        """Extract and return filtered API information."""
+        api_info = api_dict["api"]
+        bte = self.args.bte
+        api_details = self.args.api_details
+
+        # Default structure to preserve top-level keys
+        filtered_dict = {
+            key: api_dict.get(key)
+            for key in ["subject", "object", "predicate", "subject_prefix", "object_prefix"]
+        }
+
+        # Determine filtered API structure based on `bte` and `api_details`
+        if bte == 1 and api_details == 0:
+            filtered_api = {
+                **({"name": api_info["name"]} if "name" in api_info else {}),
+                **(
+                    {"smartapi": {"id": api_info["smartapi"]["id"]}}
+                    if "smartapi" in api_info and "id" in api_info["smartapi"]
+                    else {}
+                ),
+                "bte": api_info.get("bte", {}),
+            }
+        elif api_details == 1:
+            # Covers both (bte=0, api_details=1) and (bte=1, api_details=1)
+            filtered_api = api_info.copy()
+            if bte == 0:
+                filtered_api.pop("bte", None)
+        else:  # bte == 0 and api_details == 0
+            filtered_api = {
+                **({"name": api_info["name"]} if "name" in api_info else {}),
+                **(
+                    {"smartapi": {"id": api_info["smartapi"]["id"]}}
+                    if "smartapi" in api_info and "id" in api_info["smartapi"]
+                    else {}
+                ),
+            }
+
+        # Add the filtered 'api' key to the preserved top-level structure
+        filtered_dict["api"] = filtered_api
+
+        # Remove 'bte' from 'api' and move it to the top level
+        if "bte" in filtered_dict["api"]:
+            filtered_dict["bte"] = filtered_dict["api"].pop("bte")
+
+        return filtered_dict
+
+    def process_apis(self, apis):
+        """Process each API dict based on provided args."""
+        if isinstance(apis, list):
+            for i, api_dict in enumerate(apis):
+                filtered_api = self.get_filtered_api(api_dict)
+                apis[i] = filtered_api
+        elif isinstance(apis, dict):
+            if "bte" in apis:
+                # Update dict for new format
+                apis["api"]["bte"] = apis.pop("bte")
+            api_dict = apis["api"]
+            filtered_api = self.get_filtered_api(api_dict)
+            apis["api"] = filtered_api
+        return apis
+
+    async def get(self, *args, **kwargs):
+        if not self.get_argument("url", None):
+            raise HTTPError(400, reason="A url value is expected for the request, please provide a url.")
+
+        # Set initial args
+        parser = MetaKGParser()
+        url = self.get_argument("url")
+
+        try:
+            self.args.api_details = int(self.get_argument("api_details", 0))
+        except ValueError:
+            raise HTTPError(400, reason=f"Value, {self.get_argument('api_details')}, not accepted for api_details. Please enter integer, 0 or 1.")
+        try:
+            self.args.bte = int(self.get_argument("bte", 0))
+        except ValueError:
+            raise HTTPError(400, reason=f"Value,, {self.get_argument('bte')}, not accepted for bte. Please enter integer, 0 or 1.")
+
+        try:
+            trapi_data = parser.get_TRAPI_metadatas(data=None, url=url)
+        except MetadataRetrievalError as retrieve_err:
+            raise HTTPError(retrieve_err.status_code, reason=retrieve_err.message)
+        except DownloadError:
+            raise HTTPError(400, reason="There was an error downloading the data from the given input.")
+
+        # Get non-TRAPI metadata
+        try:
+            nontrapi_data = parser.get_non_TRAPI_metadatas(data=None, url=url)
+        except MetadataRetrievalError as retrieve_err:
+            raise HTTPError(retrieve_err.status_code, reason=retrieve_err.message)
+        except DownloadError:
+            raise HTTPError(400, reason="There was an error downloading the data from the given input.")
+
+        combined_data = trapi_data + nontrapi_data
+
+        # Apply filtering -- if data found
+        if combined_data:
+            for i, api_dict in enumerate(combined_data):
+                filtered_api = self.get_filtered_api(api_dict)
+                combined_data[i] = filtered_api
+
+        response = {
+            "took": 1,
+            "total": len(combined_data),
+            "max_score": 1,
+            "hits": combined_data,
+        }
+
+        self.set_header("Content-Type", "application/json")
+        self.write(response)
+
+    async def post(self, *args, **kwargs):
+        if not self.request.body:
+            raise HTTPError(400, reason="Request body cannot be empty.")
+
+        # Attempt to parse JSON body
+        try:
+            data = json.loads(self.request.body)
+        except json.JSONDecodeError:
+            raise HTTPError(400, reason=f"Unexcepted value for api_details, {self.get_argument('api_details')}. Please enter integer, 0 or 1.")
+
+        # Ensure the parsed data is a dictionary
+        if not isinstance(data, dict):
+            raise HTTPError(400, reason=f"Unexcepted value for bte, {self.get_argument('bte')}. Please enter integer, 0 or 1.")
+
+        parser = MetaKGParser()
+
+        try:
+            self.args.api_details = int(self.get_argument("api_details", 0))
+        except ValueError:
+            raise HTTPError(400, reason="Invalid query parameter value. 'api_details' and 'bte' must be integers.")
+
+        try:
+            self.args.bte = int(self.get_argument("bte", 0))
+        except ValueError:
+            raise HTTPError(400, reason=f"Unexcepted value for bte, {self.get_argument('bte')}. Please enter integer, 0 or 1.")
+
+        # Process metadata
+        try:
+            trapi_data = parser.get_TRAPI_metadatas(data=data)
+        except MetadataRetrievalError as retrieve_err:
+            raise HTTPError(retrieve_err.status_code, reason=retrieve_err.message)
+        except DownloadError:
+            raise HTTPError(400, reason="There was an error downloading the data from the given input.")
+
+        try:
+            nontrapi_data = parser.get_non_TRAPI_metadatas(data=data)
+        except MetadataRetrievalError as retrieve_err:
+            raise HTTPError(retrieve_err.status_code, reason=retrieve_err.message)
+        except DownloadError:
+            raise HTTPError(400, reason="There was an error downloading the data from the given input.")
+
+        combined_data = trapi_data + nontrapi_data
+
+        # Apply filtering -- if data found
+        if combined_data:
+            for i, api_dict in enumerate(combined_data):
+                filtered_api = self.get_filtered_api(api_dict)
+                combined_data[i] = filtered_api
+
+        response = {
+            "took": 1,
+            "total": len(combined_data),
+            "max_score": 1,
+            "hits": combined_data,
+        }
+
+        self.set_header("Content-Type", "application/json")
+        self.write(response)
